@@ -21,23 +21,23 @@ int w, h, screenshot;
 
 #define ok(expr) if (expr != 0) { printf("ERROR on line %d\n", __LINE__); exit(-1); }
 
-void save_image(const char *fname, unsigned char *data, int width, int height)
+void save_ppm(const char *fname, unsigned char *d_data, int width, int height)
 {
-    unsigned char *buffer = (unsigned char *)malloc(width * height * 4);
-    cudaMemcpy(buffer, data, width * height * 4, cudaMemcpyDeviceToHost);
+    unsigned char *h_data = (unsigned char *)malloc(width * height * 4);
+    cudaMemcpy(h_data, d_data, width * height * 4, cudaMemcpyDeviceToHost);
     FILE *f = fopen(fname, "w");
     fprintf(f, "P3 %d %d 255\n", width, height);
     for (int i = 0; i < width * height; i++) {
-        int b = data[i * 4 + 0];
-        int g = data[i * 4 + 1];
-        int r = data[i * 4 + 2];
+        unsigned char b = h_data[i * 4 + 0];
+        unsigned char g = h_data[i * 4 + 1];
+        unsigned char r = h_data[i * 4 + 2];
         fprintf(f, "%u %u %u\n", r, g, b);
     }
     fclose(f);
-    free(buffer);
+    free(h_data);
 }
 
-unsigned char *load_image(const char *fname)
+unsigned char *load_ppm(const char *fname)
 {
     int width, height;
 
@@ -45,25 +45,25 @@ unsigned char *load_image(const char *fname)
     int n = fscanf(f, "P3 %d %d 255\n", &width, &height);
     printf("image size: %d x %d\n", width, height);
 
-    unsigned char *host_buf = (unsigned char *)malloc(width * height * 4);
+    unsigned char *h_data = (unsigned char *)malloc(width * height * 4);
     for (int i = 0; i < height * width; i++) {
         int r, g, b;
 
         n = fscanf(f, "%d %d %d\n", &r, &g, &b);
-        host_buf[i * 4 + 0] = b;
-        host_buf[i * 4 + 1] = g;
-        host_buf[i * 4 + 2] = r;
-        host_buf[i * 4 + 3] = 0;
+        h_data[i * 4 + 0] = b;
+        h_data[i * 4 + 1] = g;
+        h_data[i * 4 + 2] = r;
+        h_data[i * 4 + 3] = 0;
     }
 
-    unsigned char *device_buf;
-    cudaMalloc((void **)&device_buf, width * height * 4);
-    cudaMemcpy(device_buf, host_buf, width * height * 4, cudaMemcpyHostToDevice);
+    unsigned char *d_data;
+    cudaMalloc((void **)&d_data, width * height * 4);
+    cudaMemcpy(d_data, h_data, width * height * 4, cudaMemcpyHostToDevice);
 
-    free(host_buf);
+    free(h_data);
     fclose(f);
 
-    return device_buf;
+    return d_data;
 }
 
 
@@ -87,8 +87,8 @@ void draw()
 
 		if (screenshot) {
 			printf("screenshot\n");
-			save_image("tmp/left.ppm", left.data, w, h);
-			save_image("tmp/right.ppm", right.data, w, h);
+			save_ppm("tmp/left.ppm", left.data, w, h);
+			save_ppm("tmp/right.ppm", right.data, w, h);
 			screenshot = 0;
 		}
 
@@ -157,13 +157,14 @@ int main(int argc, char **argv)
 		w = 1280;
 		h = 720;
 
-		unsigned char *d_left = load_image("tmp/left.ppm");
-		unsigned char *d_right = load_image("tmp/right.ppm");
+		unsigned char *d_left = load_ppm("tmp/left.ppm");
+		unsigned char *d_right = load_ppm("tmp/right.ppm");
 
 		stereo_init(w, h);
-		cudaMalloc(&d_display, w * h * 4);
+		cudaMalloc(&d_display, w * h * 4 * 2);
 		stereo_run(d_left, d_right, d_display);
 
+		save_ppm("tmp/out.ppm", d_display, w, h * 2);
 	}
 	
 	return 0;
