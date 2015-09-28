@@ -10,6 +10,8 @@
 
 #define ok(expr) if (expr != 0) { printf("ERROR on line %d\n", __LINE__); exit(-1); }
 
+cudnnHandle_t cudnn_handle;
+
 /* Tensor */
 struct Tensor {
     float *data;
@@ -45,6 +47,103 @@ void Tensor_resize(struct Tensor *t, int n, int c, int h, int w)
     t->size = size;
 
     ok(cudnnSetTensor4dDescriptor(t->desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w))
+}
+
+void Tensor_init_resize(struct Tensor *t, int n, int c, int h, int w)
+{
+    Tensor_init(t);
+    Tensor_resize(t, n, c, h, w);
+}
+
+
+/* ConvLayer */
+struct ConvLayer {
+	int relu;
+    struct Tensor output, weight, bias;
+    cudnnConvolutionFwdAlgo_t algorithm;
+    cudnnFilterDescriptor_t weight_desc;
+    cudnnConvolutionDescriptor_t conv_desc;
+};
+
+void ConvLayer_init(ConvLayer *e, int n_in, int n_out, int kw, int kh, int sx, int sy, int padw, int padh, int relu)
+{
+    Tensor_init(&e->output);
+    Tensor_init_resize(&e->weight, n_out, n_in, kh, kw);
+    Tensor_init_resize(&e->bias, 1, n_out, 1, 1);
+    ok(cudnnCreateFilterDescriptor(&e->weight_desc));
+    ok(cudnnSetFilter4dDescriptor(e->weight_desc, CUDNN_DATA_FLOAT, n_out, n_in, kh, kw));
+    ok(cudnnCreateConvolutionDescriptor(&e->conv_desc));
+    ok(cudnnSetConvolution2dDescriptor(e->conv_desc, padh, padw, sy, sx, 1, 1, CUDNN_CONVOLUTION));
+	e->relu = relu;
+}
+
+struct Tensor *ConvLayer_allocate(ConvLayer *e, struct Tensor *i) {
+    int n, c, h, w;
+    ok(cudnnGetConvolution2dForwardOutputDim(e->conv_desc, i->desc, e->weight_desc, &n, &c, &h, &w));
+    Tensor_resize(&e->output, n, c, h, w);
+    ok(cudnnGetConvolutionForwardAlgorithm(cudnn_handle, i->desc, e->weight_desc, e->conv_desc,
+        e->output.desc, CUDNN_CONVOLUTION_FWD_PREFER_FASTEST, 0, &e->algorithm));
+    return &e->output;
+}
+
+struct Tensor *ConvLayer_forward(ConvLayer *e, struct Tensor *i) {
+    int zero = 0;
+    int one = 1;
+    ok(cudnnConvolutionForward(cudnn_handle, &one, i->desc, i->data, e->weight_desc, e->weight.data,
+        e->conv_desc, e->algorithm, NULL, 0, &zero, e->output.desc, e->output.data));
+    ok(cudnnAddTensor(cudnn_handle, CUDNN_ADD_SAME_C, &one, e->bias.desc, e->bias.data, &one,
+        e->output.desc, e->output.data));
+	if (e->relu) {
+		ok(cudnnActivationForward(cudnn_handle, CUDNN_ACTIVATION_RELU, &one, e->output.desc, 
+			e->output.data, &zero, e->output.desc, e->output.data));
+	}
+    return &e->output;
+}
+
+/* Sequential */
+struct Sequential {
+    struct ConvLayer modules[32];
+    int num_modules;
+};
+
+void Sequential_init(struct Sequential *s)
+{
+    s->num_modules = 0;
+}
+
+void Sequential_load(struct Sequential *s, const char *dir)
+{
+	char desc_fname[32];
+
+	snprintf(desc_fname, 32, "%s/desc", dir);
+	FILE *f = fopen(desc_fname, "r");
+	int n = fscanf(f, "%d\n", &s->num_modules);
+
+	printf("load network from %s with %d conv layers\n", dir, s->num_modules);
+	for (int i = 0; i < s->num_modules; i++) {
+		int n_in, n_out, kw, kh, dw, dh, padw, padh, relu;
+		n = fscanf(f, "%d %d %d %d %d %d %d %d %d\n", &n_in, &n_out, &kw, &kh, &dw, &dh, &padw, &padh, &relu);
+		ConvLayer_init(s->modules + i, n_in, n_out, kw, kh, dw, dh, padw, padh, relu);
+		printf("conv: %d %d %d %d %d %d %d %d %d\n", n_in, n_out, kw, kh, dw, dh, padw, padh, relu);
+	}
+}
+
+struct Tensor *Sequential_allocate(struct Sequential *s, struct Tensor *input)
+{
+    struct Tensor *output = input;
+    for (int i = 0; i < s->num_modules; i++) {
+        output = ConvLayer_allocate(s->modules + i, output);
+    }
+    return output;
+}
+
+struct Tensor *Sequential_forward(struct Sequential *s, struct Tensor *input)
+{
+    struct Tensor *output = input;
+    for (int i = 0; i < s->num_modules; i++) {
+        output = ConvLayer_forward(s->modules + i, output);
+    }
+    return output;
 }
 
 double get_time()
@@ -188,20 +287,25 @@ __global__ void downsample_(float *input, float *output, int factor, int size3, 
 	}
 }
 
-void downsample(Tensor *input, Tensor *output, int factor) //, int size2_input, int size3_input)
+void downsample(Tensor *input, Tensor *output, int factor)
 {
 	assert(input->h % factor == 0);
 	assert(input->w % factor == 0);
-
 	Tensor_resize(output, 1, 1, input->h / factor, input->w / factor);
-
 	zero(output);
 	downsample_<<<GS(input->size), TB>>>(input->data, output->data, factor, input->w, input->size);
 }
 
-cudnnHandle_t cudnn_handle;
+void load_batch(Tensor *x0, Tensor *x1, Tensor *batch)
+{
+	int size = x0->size * 4;
+	Tensor_resize(batch, 2, 1, x0->h, x0->w);
+	cudaMemcpy(batch->data, x0->data, size, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(batch->data + size, x1->data, size, cudaMemcpyDeviceToDevice);
+}
 
-Tensor x0_gray_big, x1_gray_big, x0_gray, x1_gray, x0_mc, x0_disp;
+Sequential net;
+Tensor x0_gray_big, x1_gray_big, x0_gray, x1_gray, x0_mc, x0_disp, batch;
 int width_big, height_big, size_big, width, height, size;
 
 int downsample_factor = 4;
@@ -209,6 +313,14 @@ int disp_max = 64;
 
 void stereo_init(int width_arg, int height_arg)
 {
+	Tensor_init(&x0_gray_big);
+	Tensor_init(&x1_gray_big);
+	Tensor_init(&x0_gray);
+	Tensor_init(&x1_gray);
+	Tensor_init(&x0_mc);
+	Tensor_init(&x0_disp);
+	Tensor_init(&batch);
+
     width_big = width_arg;
     height_big = height_arg;
     size_big = width_big * height_big;
@@ -220,16 +332,14 @@ void stereo_init(int width_arg, int height_arg)
     height = height_big / downsample_factor;
     size = width * height;
 
-    printf("stereo_init: %d x %d\n", width, height);
-
 	ok(cudnnCreate(&cudnn_handle));
-	
-	Tensor_init(&x0_gray_big);
-	Tensor_init(&x1_gray_big);
-	Tensor_init(&x0_gray);
-	Tensor_init(&x1_gray);
-	Tensor_init(&x0_mc);
-	Tensor_init(&x0_disp);
+
+	Tensor_resize(&batch, 2, 1, height, width);
+	Sequential_init(&net);
+	Sequential_load(&net, "tmp/foo");
+	Sequential_allocate(&net, &batch);
+
+    printf("stereo_init: %d x %d\n", width, height);
 }
 
 void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
@@ -240,9 +350,12 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 	downsample(&x0_gray_big, &x0_gray, downsample_factor);
 	downsample(&x1_gray_big, &x1_gray, downsample_factor);
 
-	ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
-	argmin(&x0_mc, &x0_disp);
+	load_batch(&x0_gray, &x1_gray, &batch);
+	Sequential_forward(&net, &batch);
+
+//	ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
+//	argmin(&x0_mc, &x0_disp);
 
 	gray2display(&x0_gray, display);
-	gray2display(&x0_disp, display + size * 4);
+	gray2display(&x1_gray, display + size * 4);
 }
