@@ -55,6 +55,22 @@ void Tensor_init_resize(struct Tensor *t, int n, int c, int h, int w)
 	Tensor_resize(t, n, c, h, w);
 }
 
+void Tensor_print(struct Tensor *t)
+{
+	float *buf = (float *)malloc(t->size * 4);
+	cudaMemcpy(buf, t->data, t->size * 4, cudaMemcpyDeviceToHost);
+	printf("%d x %d x %d x %d\n", t->n, t->c, t->h, t->w);
+	int i = 0;
+	int j = 0;
+	for (int k = 0; k < min(t->h, 6); k++) {
+		for (int l = 0; l < min(t->w, 6); l++) {
+			printf("%e ", buf[((i * t->c + j) * t->h + k) * t->w + l]);
+		}
+		printf("\n");
+	}
+	free(buf);
+}
+
 
 /* ConvLayer */
 struct ConvLayer {
@@ -105,11 +121,6 @@ struct Sequential {
 	struct ConvLayer modules[32];
 	int num_modules;
 };
-
-void Sequential_init(struct Sequential *s)
-{
-	s->num_modules = 0;
-}
 
 void Sequential_load(struct Sequential *s, const char *dir)
 {
@@ -167,6 +178,19 @@ void zero(Tensor *t)
 	zero_<<<GS(t->size), TB>>>(t->data, t->size);
 }
 
+__global__ void add_(float *input, float value, int size)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size) {
+		input[id] = input[id] + value;
+	}
+}
+
+void add(Tensor *t, float value)
+{
+	add_<<<GS(t->size), TB>>>(t->data, value, t->size);
+}
+
 __global__ void mul_(float *input, float factor, int size)
 {
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,6 +236,42 @@ void gray2display(Tensor *input, unsigned char *display)
 {
 	gray2display_<<<GS(input->size), TB>>>(input->data, display, input->size);
 }
+
+__global__ void Normalize_get_norm_(float *input, float *norm, int size1, int size23, int size023)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size023) {
+		int dim23 = id % size23;
+		int dim0 = id / size23;
+
+		float sum = 0.0;
+		for (int dim1 = 0; dim1 < size1; dim1++) {
+			float x = input[(dim0 * size1 + dim1) * size23 + dim23];
+			sum += x * x;
+		}
+		norm[dim0 * size23 + dim23] = sum + 1.3e-37;
+	}
+}
+
+__global__ void Normalize_forward_(float *input, float *norm, float *output, int size23, int size123, int size0123)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size0123) {
+		int dim23 = id % size23;
+		int dim0 = (id / size123);
+		output[id] = input[id] / sqrtf(norm[dim0 * size23 + dim23]);
+	}
+}
+
+void Normalize_forward(Tensor *input, Tensor *norm)
+{
+	Tensor_resize(norm, input->n, 1, input->h, input->w);
+	Normalize_get_norm_<<<GS(norm->size), TB>>>(input->data, norm->data, input->c, 
+		input->h * input->w, norm->size);
+	Normalize_forward_<<<GS(input->size), TB>>>(input->data, norm->data, input->data,
+		input->h * input->w, input->c * input->h * input->w, input->size);
+}
+
 
 __global__ void ad_(float *x0, float *x1, float *output, int size, int size2, int size3, int direction)
 {
@@ -305,11 +365,13 @@ void load_batch(Tensor *x0, Tensor *x1, Tensor *batch)
 }
 
 Sequential net;
-Tensor x0_gray_big, x1_gray_big, x0_gray, x1_gray, x0_mc, x0_disp, batch;
+Tensor x0_gray_big, x1_gray_big, x0_gray, x1_gray, x0_mc, x0_disp, batch, norm;
 int width_big, height_big, size_big, width, height, size;
 
 int downsample_factor = 5;
-int disp_max = 64;
+int disp_max = 32;
+const float mean = 95;
+const float stddev = 65;
 
 void stereo_init(int width_arg, int height_arg)
 {
@@ -320,6 +382,7 @@ void stereo_init(int width_arg, int height_arg)
 	Tensor_init(&x0_mc);
 	Tensor_init(&x0_disp);
 	Tensor_init(&batch);
+	Tensor_init(&norm);
 
 	width_big = width_arg;
 	height_big = height_arg;
@@ -335,7 +398,6 @@ void stereo_init(int width_arg, int height_arg)
 	ok(cudnnCreate(&cudnn_handle));
 
 	Tensor_resize(&batch, 2, 1, height, width);
-	Sequential_init(&net);
 	Sequential_load(&net, "tmp/foo");
 	Sequential_allocate(&net, &batch);
 
@@ -350,11 +412,25 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 	downsample(&x0_gray_big, &x0_gray, downsample_factor);
 	downsample(&x1_gray_big, &x1_gray, downsample_factor);
 
+	// image preprocessing
+	add(&x0_gray, -mean);
+	mul(&x0_gray, 1 / stddev);
+	add(&x1_gray, -mean);
+	mul(&x1_gray, 1 / stddev);
+
 	load_batch(&x0_gray, &x1_gray, &batch);
 	Sequential_forward(&net, &batch);
+	Normalize_forward(&batch, &norm);
+	Tensor_print(&norm);
 
 //	ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
 //	argmin(&x0_mc, &x0_disp);
+
+	// undo image preprocessing
+	mul(&x0_gray, stddev);
+	add(&x0_gray, mean);
+	mul(&x1_gray, stddev);
+	add(&x1_gray, mean);
 
 	gray2display(&x0_gray, display);
 	gray2display(&x1_gray, display + size * 4);
