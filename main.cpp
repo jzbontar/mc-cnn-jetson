@@ -10,6 +10,7 @@
 
 extern void stereo_init(int, int);
 extern void stereo_run(unsigned char *, unsigned char *, unsigned char *);
+extern int downsample_factor;
 
 using namespace sl::zed;
 
@@ -97,7 +98,7 @@ void draw()
 		cudaArray_t ArrIm;
 		cudaGraphicsMapResources(1, &pcu_display, 0);
 		cudaGraphicsSubResourceGetMappedArray(&ArrIm, pcu_display, 0, 0);
-		cudaMemcpy2DToArray(ArrIm, 0, 0, d_display, 4 * w, 4 * w, 2 * h, cudaMemcpyDeviceToDevice);
+		cudaMemcpy2DToArray(ArrIm, 0, 0, d_display, 4 * (w / downsample_factor), 4 * (w / downsample_factor), 2 * (h / downsample_factor), cudaMemcpyDeviceToDevice);
 		cudaGraphicsUnmapResources(1, &pcu_display, 0);
 
 		glDrawBuffer(GL_BACK);
@@ -139,12 +140,12 @@ int main(int argc, char **argv)
 		glBindTexture(GL_TEXTURE_2D, tex_display);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexImage2D(GL_TEXTURE_2D, 0, 4, w, 2 * h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexImage2D(GL_TEXTURE_2D, 0, 4, (w / downsample_factor), 2 * (h / downsample_factor), 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		glBindTexture(GL_TEXTURE_2D, 0);
 		ok(cudaGraphicsGLRegisterImage(&pcu_display, tex_display, GL_TEXTURE_2D, cudaGraphicsMapFlagsNone));
 
 		stereo_init(w, h);
-		cudaMalloc(&d_display, w * h * 4 * 2);
+		cudaMalloc(&d_display, (w / downsample_factor) * (h / downsample_factor) * 4 * 2);
 
 		screenshot = 0;
 
@@ -152,8 +153,6 @@ int main(int argc, char **argv)
 		glutDisplayFunc(draw);
 		glutMainLoop();
 	} else {
-		printf("stereo test\n");
-
 		w = 1280;
 		h = 720;
 
@@ -161,10 +160,9 @@ int main(int argc, char **argv)
 		unsigned char *d_right = load_ppm("tmp/right.ppm");
 
 		stereo_init(w, h);
-		cudaMalloc(&d_display, w * h * 4 * 2);
+		cudaMalloc(&d_display, (w / downsample_factor) * (h / downsample_factor) * 4 * 2);
 		stereo_run(d_left, d_right, d_display);
-
-		save_ppm("tmp/out.ppm", d_display, w, h * 2);
+		save_ppm("tmp/out.ppm", d_display, (w / downsample_factor), (h / downsample_factor) * 2);
 	}
 	
 	return 0;
