@@ -1,7 +1,12 @@
-#include <stdio.h>
 #include <assert.h>
+#include <fcntl.h>
 #include <math_constants.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 
 #include <cudnn.h>
 
@@ -89,7 +94,7 @@ void ConvLayer_init(ConvLayer *e, int n_in, int n_out, int kw, int kh, int sx, i
 	ok(cudnnCreateFilterDescriptor(&e->weight_desc));
 	ok(cudnnSetFilter4dDescriptor(e->weight_desc, CUDNN_DATA_FLOAT, n_out, n_in, kh, kw));
 	ok(cudnnCreateConvolutionDescriptor(&e->conv_desc));
-	ok(cudnnSetConvolution2dDescriptor(e->conv_desc, padh, padw, sy, sx, 1, 1, CUDNN_CONVOLUTION));
+	ok(cudnnSetConvolution2dDescriptor(e->conv_desc, padh, padw, sy, sx, 1, 1, CUDNN_CROSS_CORRELATION));
 	e->relu = relu;
 }
 
@@ -103,8 +108,8 @@ struct Tensor *ConvLayer_allocate(ConvLayer *e, struct Tensor *i) {
 }
 
 struct Tensor *ConvLayer_forward(ConvLayer *e, struct Tensor *i) {
-	int zero = 0;
-	int one = 1;
+	float zero = 0;
+	float one = 1;
 	ok(cudnnConvolutionForward(cudnn_handle, &one, i->desc, i->data, e->weight_desc, e->weight.data,
 		e->conv_desc, e->algorithm, NULL, 0, &zero, e->output.desc, e->output.data));
 	ok(cudnnAddTensor(cudnn_handle, CUDNN_ADD_SAME_C, &one, e->bias.desc, e->bias.data, &one,
@@ -122,12 +127,19 @@ struct Sequential {
 	int num_modules;
 };
 
+void mmap2gpu(const char *fname, float *data, int size)
+{
+	int fd = open(fname, O_RDONLY);
+	float *map = (float *)mmap(NULL, size * 4, PROT_READ, MAP_SHARED, fd, 0);
+	cudaMemcpy(data, map, size, cudaMemcpyHostToDevice);
+	close(fd);
+}
+
 void Sequential_load(struct Sequential *s, const char *dir)
 {
-	char desc_fname[32];
-
-	snprintf(desc_fname, 32, "%s/desc", dir);
-	FILE *f = fopen(desc_fname, "r");
+	char buf[256];
+	snprintf(buf, 256, "%s/desc", dir);
+	FILE *f = fopen(buf, "r");
 	int n = fscanf(f, "%d\n", &s->num_modules);
 
 	printf("load network from %s with %d conv layers\n", dir, s->num_modules);
@@ -136,6 +148,11 @@ void Sequential_load(struct Sequential *s, const char *dir)
 		n = fscanf(f, "%d %d %d %d %d %d %d %d %d\n", &n_in, &n_out, &kw, &kh, &dw, &dh, &padw, &padh, &relu);
 		ConvLayer_init(s->modules + i, n_in, n_out, kw, kh, dw, dh, padw, padh, relu);
 		printf("conv: %d %d %d %d %d %d %d %d %d\n", n_in, n_out, kw, kh, dw, dh, padw, padh, relu);
+
+		snprintf(buf, 256, "%s/%dW", dir, i);
+		mmap2gpu(buf, s->modules[i].weight.data, s->modules[i].weight.size);
+		snprintf(buf, 256, "%s/%dB", dir, i);
+		mmap2gpu(buf, s->modules[i].bias.data, s->modules[i].bias.size);
 	}
 }
 
@@ -272,6 +289,38 @@ void Normalize_forward(Tensor *input, Tensor *norm)
 		input->h * input->w, input->c * input->h * input->w, input->size);
 }
 
+__global__ void StereoJoin_(float *input_L, float *input_R, float *output_L, float *output_R, int size1_input, int size1, int size3, int size23)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size23) {
+		int dim3 = id % size3;
+		assert(size1_input <= 32);
+		float L_cache[32];
+		for (int i = 0; i < size1_input; i++) {
+			L_cache[i] = input_L[i * size23 + id];
+		}
+
+		for (int d = 0; d < size1; d++) {
+			if (dim3 - d >= 0) {
+				float sum = 0;
+				for (int i = 0; i < size1_input; i++) {
+					sum -= L_cache[i] * input_R[i * size23 + id - d];
+				}
+				output_L[d * size23 + id] = sum;
+				output_R[d * size23 + id - d] = sum;
+			}
+		}
+	}
+}
+
+void StereoJoin(Tensor *input, Tensor *output_L, Tensor *output_R, int disp_max)
+{
+	Tensor_resize(output_L, 1, disp_max, input->h, input->w);
+	Tensor_resize(output_R, 1, disp_max, input->h, input->w);
+	int size23 = input->h * input->w;
+	StereoJoin_<<<GS(size23), TB>>>(input->data, input->data + input->size / 2, output_L->data, output_R->data,
+		input->c, output_L->c, output_L->w, size23);
+}
 
 __global__ void ad_(float *x0, float *x1, float *output, int size, int size2, int size3, int direction)
 {
@@ -365,10 +414,10 @@ void load_batch(Tensor *x0, Tensor *x1, Tensor *batch)
 }
 
 Sequential net;
-Tensor x0_gray_big, x1_gray_big, x0_gray, x1_gray, x0_mc, x0_disp, batch, norm;
+Tensor x0_gray_big, x1_gray_big, x0_gray, x1_gray, x0_mc, x1_mc, x0_disp, x1_disp, batch, norm;
 int width_big, height_big, size_big, width, height, size;
 
-int downsample_factor = 5;
+int downsample_factor = 10;
 int disp_max = 32;
 const float mean = 95;
 const float stddev = 65;
@@ -380,7 +429,9 @@ void stereo_init(int width_arg, int height_arg)
 	Tensor_init(&x0_gray);
 	Tensor_init(&x1_gray);
 	Tensor_init(&x0_mc);
+	Tensor_init(&x1_mc);
 	Tensor_init(&x0_disp);
+	Tensor_init(&x1_disp);
 	Tensor_init(&batch);
 	Tensor_init(&norm);
 
@@ -398,7 +449,7 @@ void stereo_init(int width_arg, int height_arg)
 	ok(cudnnCreate(&cudnn_handle));
 
 	Tensor_resize(&batch, 2, 1, height, width);
-	Sequential_load(&net, "tmp/foo");
+	Sequential_load(&net, "net/net_kitti_fast_-a_train_tr_-fm_16");
 	Sequential_allocate(&net, &batch);
 
 	printf("stereo_init: %d x %d\n", width, height);
@@ -418,13 +469,18 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 	add(&x1_gray, -mean);
 	mul(&x1_gray, 1 / stddev);
 
+	// network
 	load_batch(&x0_gray, &x1_gray, &batch);
-	Sequential_forward(&net, &batch);
-	Normalize_forward(&batch, &norm);
-	Tensor_print(&norm);
+	Tensor *output = Sequential_forward(&net, &batch);
+	Normalize_forward(output, &norm);
+	StereoJoin(output, &x0_mc, &x1_mc, disp_max);
 
-//	ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
-//	argmin(&x0_mc, &x0_disp);
+	// stereo method
+	argmin(&x0_mc, &x0_disp);
+
+	// absolute differences
+	// ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
+	// argmin(&x0_mc, &x0_disp);
 
 	// undo image preprocessing
 	mul(&x0_gray, stddev);
@@ -433,5 +489,5 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 	add(&x1_gray, mean);
 
 	gray2display(&x0_gray, display);
-	gray2display(&x1_gray, display + size * 4);
+	gray2display(&x0_disp, display + size * 4);
 }

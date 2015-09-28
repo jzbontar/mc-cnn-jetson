@@ -3,3 +3,5 @@
 *.so
 *.ppm
 main
+net/
+tmp/
