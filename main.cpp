@@ -139,7 +139,7 @@ int main(int argc, char **argv)
 		glGenTextures(1, &tex_display);
 		glBindTexture(GL_TEXTURE_2D, tex_display);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexImage2D(GL_TEXTURE_2D, 0, 4, (w / downsample_factor), 2 * (h / downsample_factor), 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		glBindTexture(GL_TEXTURE_2D, 0);
 		ok(cudaGraphicsGLRegisterImage(&pcu_display, tex_display, GL_TEXTURE_2D, cudaGraphicsMapFlagsNone));

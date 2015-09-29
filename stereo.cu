@@ -170,7 +170,7 @@ struct Tensor *ConvLayer_forward(ConvLayer *e, struct Tensor *i) {
 /* Sequential */
 struct Sequential {
 	struct ConvLayer modules[32];
-	int num_modules;
+	int num_modules, pad_size;
 };
 
 void mmap2gpu(const char *fname, float *data, int size)
@@ -188,6 +188,7 @@ void Sequential_load(struct Sequential *s, const char *dir)
 	FILE *f = fopen(buf, "r");
 	int n = fscanf(f, "%d\n", &s->num_modules);
 
+	s->pad_size = 0;
 	printf("load network from %s with %d conv layers\n", dir, s->num_modules);
 	for (int i = 0; i < s->num_modules; i++) {
 		int n_in, n_out, kw, kh, dw, dh, padw, padh, relu;
@@ -199,6 +200,8 @@ void Sequential_load(struct Sequential *s, const char *dir)
 		mmap2gpu(buf, s->modules[i].weight.data, s->modules[i].weight.size * 4);
 		snprintf(buf, 256, "%s/%dB", dir, i);
 		mmap2gpu(buf, s->modules[i].bias.data, s->modules[i].bias.size * 4);
+		assert(padw == padh);
+		s->pad_size += padw;
 	}
 }
 
@@ -331,10 +334,28 @@ void StereoJoin(Tensor *input, Tensor *output_L, Tensor *output_R, int disp_max)
 		input->c, output_L->c, output_L->w, size23);
 }
 
+__global__ void fix_border_(float *input, int pad_size, int side, int size3, int size23)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size23) {
+		int x = id % size3;
+		int y = id / size3;
+		if (side == 0 && x < pad_size) {
+			input[id] = input[y * size3 + pad_size];
+		} else if (side == 1 && x > size3 - pad_size - 1) {
+			input[id] = input[y * size3 + size3 - pad_size - 1];
+		}
+	}
+}
+
+void fix_border(Tensor *input, int pad_size, int side)
+{
+	fix_border_<<<GS(input->size), TB>>>(input->data, pad_size, side, input->w, input->size);
+}
+
 __global__ void ad_(float *x0, float *x1, float *output, int size, int size2, int size3, int direction)
 {
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
-
 	if (id < size) {
 		int d = id;
 		int x = d % size3;
@@ -485,11 +506,13 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 
 	// stereo method
 	argmin(&x0_mc, &x0_disp);
-	mul(&x0_disp, 8);
+	argmin(&x1_mc, &x1_disp);
+	fix_border(&x0_disp, net.pad_size, 1);
+	fix_border(&x1_disp, net.pad_size, 0);
 
-	// absolute differences
-	// ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
-	// argmin(&x0_mc, &x0_disp);
+//	// absolute differences
+//	ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
+//	argmin(&x0_mc, &x0_disp);
 
 	// undo image preprocessing
 	mul(&x0_gray, stddev);
@@ -497,6 +520,8 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 	mul(&x1_gray, stddev);
 	add(&x1_gray, mean);
 
+	mul(&x0_disp, 8);
+	mul(&x1_disp, 8);
 	gray2display(&x0_gray, display);
-	gray2display(&x0_disp, display + size * 4);
+	gray2display(&x1_disp, display + size * 4);
 }
