@@ -60,15 +60,17 @@ void Tensor_init_resize(struct Tensor *t, int n, int c, int h, int w)
 	Tensor_resize(t, n, c, h, w);
 }
 
-void Tensor_print(struct Tensor *t)
+void Tensor_print_ext(struct Tensor *t, int n, int c, int h, int w)
 {
 	float *buf = (float *)malloc(t->size * 4);
 	cudaMemcpy(buf, t->data, t->size * 4, cudaMemcpyDeviceToHost);
-	printf("%d x %d x %d x %d\n", t->n, t->c, t->h, t->w);
-	int i = 0;
-	int j = 0;
-	for (int k = 0; k < min(t->h, 6); k++) {
-		for (int l = 0; l < min(t->w, 6); l++) {
+	printf("%d x %d x %d x %d; %d, %d, %d, %d\n", t->n, t->c, t->h, t->w, n, c, h, w);
+	assert(n < t->n);
+	assert(c < t->c);
+	int i = n;
+	int j = c;
+	for (int k = h; k < min(t->h, h + 6); k++) {
+		for (int l = w; l < min(t->w, w + 6); l++) {
 			printf("%e ", buf[((i * t->c + j) * t->h + k) * t->w + l]);
 		}
 		printf("\n");
@@ -76,6 +78,49 @@ void Tensor_print(struct Tensor *t)
 	free(buf);
 }
 
+void Tensor_print(struct Tensor *t)
+{
+	Tensor_print_ext(t, 0, 0, 0, 0);
+}
+
+__global__ void fill_(float *input, float value, int size)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size) {
+		input[id] = value;
+	}
+}
+
+void fill(Tensor *t, float value)
+{
+	fill_<<<GS(t->size), TB>>>(t->data, value, t->size);
+}
+
+__global__ void add_(float *input, float value, int size)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size) {
+		input[id] = input[id] + value;
+	}
+}
+
+void add(Tensor *t, float value)
+{
+	add_<<<GS(t->size), TB>>>(t->data, value, t->size);
+}
+
+__global__ void mul_(float *input, float factor, int size)
+{
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < size) {
+		input[id] = input[id] * factor;
+	}
+}
+
+void mul(Tensor *t, float factor)
+{
+	mul_<<<GS(t->size), TB>>>(t->data, factor, t->size);
+}
 
 /* ConvLayer */
 struct ConvLayer {
@@ -102,6 +147,7 @@ struct Tensor *ConvLayer_allocate(ConvLayer *e, struct Tensor *i) {
 	int n, c, h, w;
 	ok(cudnnGetConvolution2dForwardOutputDim(e->conv_desc, i->desc, e->weight_desc, &n, &c, &h, &w));
 	Tensor_resize(&e->output, n, c, h, w);
+	fill(&e->output, 0);
 	ok(cudnnGetConvolutionForwardAlgorithm(cudnn_handle, i->desc, e->weight_desc, e->conv_desc,
 		e->output.desc, CUDNN_CONVOLUTION_FWD_PREFER_FASTEST, 0, &e->algorithm));
 	return &e->output;
@@ -150,9 +196,9 @@ void Sequential_load(struct Sequential *s, const char *dir)
 		printf("conv: %d %d %d %d %d %d %d %d %d\n", n_in, n_out, kw, kh, dw, dh, padw, padh, relu);
 
 		snprintf(buf, 256, "%s/%dW", dir, i);
-		mmap2gpu(buf, s->modules[i].weight.data, s->modules[i].weight.size);
+		mmap2gpu(buf, s->modules[i].weight.data, s->modules[i].weight.size * 4);
 		snprintf(buf, 256, "%s/%dB", dir, i);
-		mmap2gpu(buf, s->modules[i].bias.data, s->modules[i].bias.size);
+		mmap2gpu(buf, s->modules[i].bias.data, s->modules[i].bias.size * 4);
 	}
 }
 
@@ -180,45 +226,6 @@ double get_time()
 	struct timezone tzp;
 	gettimeofday(&t, &tzp);
 	return t.tv_sec + t.tv_usec * 1e-6;
-}
-
-__global__ void zero_(float *input, int size)
-{
-	int id = blockIdx.x * blockDim.x + threadIdx.x;
-	if (id < size) {
-		input[id] = 0;
-	}
-}
-
-void zero(Tensor *t)
-{
-	zero_<<<GS(t->size), TB>>>(t->data, t->size);
-}
-
-__global__ void add_(float *input, float value, int size)
-{
-	int id = blockIdx.x * blockDim.x + threadIdx.x;
-	if (id < size) {
-		input[id] = input[id] + value;
-	}
-}
-
-void add(Tensor *t, float value)
-{
-	add_<<<GS(t->size), TB>>>(t->data, value, t->size);
-}
-
-__global__ void mul_(float *input, float factor, int size)
-{
-	int id = blockIdx.x * blockDim.x + threadIdx.x;
-	if (id < size) {
-		input[id] = input[id] * factor;
-	}
-}
-
-void mul(Tensor *t, float factor)
-{
-	mul_<<<GS(t->size), TB>>>(t->data, factor, t->size);
 }
 
 void __global__ rgb2gray_(unsigned char *input, float *output, int size)
@@ -317,6 +324,8 @@ void StereoJoin(Tensor *input, Tensor *output_L, Tensor *output_R, int disp_max)
 {
 	Tensor_resize(output_L, 1, disp_max, input->h, input->w);
 	Tensor_resize(output_R, 1, disp_max, input->h, input->w);
+	fill(output_L, NAN);
+	fill(output_R, NAN);
 	int size23 = input->h * input->w;
 	StereoJoin_<<<GS(size23), TB>>>(input->data, input->data + input->size / 2, output_L->data, output_R->data,
 		input->c, output_L->c, output_L->w, size23);
@@ -349,7 +358,7 @@ __global__ void ad_(float *x0, float *x1, float *output, int size, int size2, in
 			}
 			dist /= cnt;
 		} else {
-			dist = CUDART_NAN;
+			dist = CUDART_NAN_F;
 		}
 		output[id] = dist;
 	}
@@ -367,7 +376,7 @@ __global__ void argmin_(float *input, float *output, int size1, int size23)
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
 	if (id < size23) {
 		int argmin = 0;
-		float min = CUDART_INF;
+		float min = CUDART_INF_F;
 		for (int i = 0; i < size1; i++) {
 			float val = input[i * size23 + id];
 			if (val < min) {
@@ -401,16 +410,15 @@ void downsample(Tensor *input, Tensor *output, int factor)
 	assert(input->h % factor == 0);
 	assert(input->w % factor == 0);
 	Tensor_resize(output, 1, 1, input->h / factor, input->w / factor);
-	zero(output);
+	fill(output, 0);
 	downsample_<<<GS(input->size), TB>>>(input->data, output->data, factor, input->w, input->size);
 }
 
 void load_batch(Tensor *x0, Tensor *x1, Tensor *batch)
 {
-	int size = x0->size * 4;
 	Tensor_resize(batch, 2, 1, x0->h, x0->w);
-	cudaMemcpy(batch->data, x0->data, size, cudaMemcpyDeviceToDevice);
-	cudaMemcpy(batch->data + size, x1->data, size, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(batch->data, x0->data, x0->size * 4, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(batch->data + x0->size, x1->data, x0->size * 4, cudaMemcpyDeviceToDevice);
 }
 
 Sequential net;
@@ -477,6 +485,7 @@ void stereo_run(unsigned char *x0, unsigned char *x1, unsigned char *display)
 
 	// stereo method
 	argmin(&x0_mc, &x0_disp);
+	mul(&x0_disp, 8);
 
 	// absolute differences
 	// ad(&x0_gray, &x1_gray, &x0_mc, disp_max, -1);
